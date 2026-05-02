@@ -10,10 +10,6 @@
   loguru,
   matplotlib,
 }:
-# Stub Nahual derivation — used so the Nix dev shell can resolve `nahual`
-# alongside editor tooling. The actual server runtime installs nahual via
-# pip into the conda env (since micro-sam itself depends on conda-forge-only
-# packages like nifty / vigra / python-elf that have no PyPI distribution).
 buildPythonPackage {
   pname = "nahual";
   version = "0.0.8";

@@ -28,45 +28,80 @@
             cudaSupport = true;
           };
         };
+
+        # Pin to the default python (3.13 on current unstable). vigra,
+        # nifty, affogato all build their pybind11 modules against this
+        # interpreter; bumping it forces a full C++ rebuild of all three.
+        # We further override numba's pytestCheckPhase: turning on
+        # cudaSupport flips the closure off the binary cache, so
+        # nixpkgs would otherwise re-run numba's 30+ min serial test
+        # suite on every dev shell.
+        python = pkgs.python3.override {
+          packageOverrides = pyfinal: pyprev: {
+            numba = pyprev.numba.overridePythonAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+              pytestCheckPhase = "true";
+              installCheckPhase = "true";
+            });
+            # numbagg's pytest also takes ~15 min on the cuda-enabled
+            # closure. Skip it -- our import path goes through
+            # xarray->numbagg only at module-load time.
+            numbagg = pyprev.numbagg.overridePythonAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+              pytestCheckPhase = "true";
+              installCheckPhase = "true";
+            });
+            # Same story for xarray: cudaSupport-enabled scope means we
+            # rebuild it from scratch, and its pytest suite is huge
+            # (and downloads test fixtures from the network in the
+            # sandbox, which then hangs).
+            xarray = pyprev.xarray.overridePythonAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+              pytestCheckPhase = "true";
+              installCheckPhase = "true";
+            });
+          };
+        };
+
+        ourPackages = pkgs.callPackage ./nix {
+          python3Packages = python.pkgs;
+        };
       in
       with pkgs;
       rec {
-        # micro-sam pulls in conda-forge-only deps (nifty, vigra Python
-        # bindings, torch_em, python-elf) that have no PyPI distribution
-        # and would each need significant Nix packaging. We bootstrap a
-        # conda environment via micromamba on first run and cache it under
-        # ``$XDG_CACHE_HOME/micro-sam/envs``. Subsequent runs reuse it.
+        formatter = pkgs.alejandra;
+
+        # Re-pack as a simple attrset so `nix flake check` doesn't try to
+        # treat passthru / override functions as derivations.
+        packages = {
+          inherit (ourPackages)
+            nahual
+            segment_anything
+            vigra
+            affogato
+            nifty
+            python-elf
+            torch_em
+            micro_sam
+            ;
+          default = ourPackages.micro_sam;
+        };
+
         apps.default =
           let
-            envYaml = ./nix/env-server.yaml;
+            python_with_pkgs = python.withPackages (pp: [
+              ourPackages.nahual
+              ourPackages.micro_sam
+              # micro_sam already depends on segment_anything / torch_em /
+              # python-elf / nifty / vigra transitively. Listed here for
+              # debuggability of `nix run` env.
+            ]);
             runServer = pkgs.writeScriptBin "runserver.sh" ''
               #!${pkgs.bash}/bin/bash
-              set -euo pipefail
-
-              export MAMBA_ROOT_PREFIX="''${MAMBA_ROOT_PREFIX:-$HOME/.cache/micro-sam/mamba}"
-              ENV_NAME="micro_sam_server"
-              ENV_PREFIX="$MAMBA_ROOT_PREFIX/envs/$ENV_NAME"
-
-              # CUDA libs must be visible to torch's nvrtc / cudnn loader at
-              # runtime. /run/opengl-driver/lib carries the NixOS-managed
-              # NVIDIA driver libs (libcuda.so etc.) — without it the
-              # conda-forge pytorch reports torch.cuda.is_available() == False
-              # despite the GPU being present.
-              export CUDA_PATH="${pkgs.cudaPackages.cudatoolkit}"
-              export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.cudaPackages.cudatoolkit}/lib:${pkgs.cudaPackages.cudnn}/lib:''${LD_LIBRARY_PATH:-}"
-
-              if [ ! -d "$ENV_PREFIX" ]; then
-                echo "[micro-sam] First run: creating conda env at $ENV_PREFIX (one-time, ~10 min cold)..." >&2
-                ${pkgs.micromamba}/bin/micromamba create -y -n "$ENV_NAME" -f "${envYaml}"
-              fi
-
-              # micro_sam itself lives in the source tree of this flake; expose it.
-              export PYTHONPATH="${self}:''${PYTHONPATH:-}"
-              # Don't let pooch get confused by per-user XDG_CACHE_HOME redirects.
-              export MICROSAM_CACHEDIR="''${MICROSAM_CACHEDIR:-$HOME/.cache/micro_sam}"
-
-              exec ${pkgs.micromamba}/bin/micromamba run -n "$ENV_NAME" \
-                python ${self}/server.py "''${@:-ipc:///tmp/microsam.ipc}"
+              ${python_with_pkgs}/bin/python ${self}/server.py ''${@:-"ipc:///tmp/microsam.ipc"}
             '';
           in
           {
@@ -74,60 +109,26 @@
             program = "${runServer}/bin/runserver.sh";
           };
 
-        formatter = pkgs.alejandra;
-
-        packages = {
-          # Provided so the Nix dev shell exposes `nahual` for tooling.
-          # The runtime install happens via pip inside the conda env.
-          nahual = pkgs.python3.pkgs.callPackage ./nix/nahual.nix {
-            pynng = pkgs.python3Packages.pynng or null;
-          };
-        };
-
         devShells = {
-          # Dev shell mirrors the runtime: micromamba bootstraps the conda env
-          # on entry, then exposes its python3 + the source tree on PATH.
           default =
             let
-              envYaml = ./nix/env-server.yaml;
-              activate = pkgs.writeShellScriptBin "microsam-activate" ''
-                set -e
-                export MAMBA_ROOT_PREFIX="''${MAMBA_ROOT_PREFIX:-$HOME/.cache/micro-sam/mamba}"
-                ENV_NAME="micro_sam_server"
-                ENV_PREFIX="$MAMBA_ROOT_PREFIX/envs/$ENV_NAME"
-                if [ ! -d "$ENV_PREFIX" ]; then
-                  ${pkgs.micromamba}/bin/micromamba create -y -n "$ENV_NAME" -f "${envYaml}"
-                fi
-                eval "$(${pkgs.micromamba}/bin/micromamba shell hook -s bash)"
-                micromamba activate "$ENV_NAME"
-                exec "$@"
-              '';
+              python_with_pkgs = python.withPackages (pp: [
+                ourPackages.nahual
+                ourPackages.micro_sam
+                # Dev-only extras the basic_test / client examples touch.
+                pp.tifffile
+                pp.scikit-image
+                pp.scikit-learn
+                pp.pyyaml
+              ]);
             in
             mkShell {
               packages = [
-                pkgs.micromamba
+                python_with_pkgs
                 pkgs.cudaPackages.cudatoolkit
-                pkgs.cudaPackages.cudnn
-                pkgs.bashInteractive
-                activate
               ];
               shellHook = ''
-                export MAMBA_ROOT_PREFIX="''${MAMBA_ROOT_PREFIX:-$HOME/.cache/micro-sam/mamba}"
-                export CUDA_PATH="${pkgs.cudaPackages.cudatoolkit}"
-                # /run/opengl-driver/lib supplies libcuda.so on NixOS;
-                # without it conda-forge pytorch sees no GPU.
-                export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.cudaPackages.cudatoolkit}/lib:${pkgs.cudaPackages.cudnn}/lib:''${LD_LIBRARY_PATH:-}"
-                export PYTHONPATH="$PWD:''${PYTHONPATH:-}"
-                export MICROSAM_CACHEDIR="''${MICROSAM_CACHEDIR:-$HOME/.cache/micro_sam}"
-
-                ENV_NAME="micro_sam_server"
-                ENV_PREFIX="$MAMBA_ROOT_PREFIX/envs/$ENV_NAME"
-                if [ ! -d "$ENV_PREFIX" ]; then
-                  echo "[micro-sam] Bootstrapping conda env at $ENV_PREFIX (one-time)..." >&2
-                  ${pkgs.micromamba}/bin/micromamba create -y -n "$ENV_NAME" -f "${./nix/env-server.yaml}"
-                fi
-                eval "$(${pkgs.micromamba}/bin/micromamba shell hook -s bash)"
-                micromamba activate "$ENV_NAME"
+                export PYTHONPATH=${python_with_pkgs}/${python_with_pkgs.sitePackages}:$PYTHONPATH
               '';
             };
         };
