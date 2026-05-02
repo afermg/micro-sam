@@ -1,0 +1,44 @@
+name: micro_sam_server
+# Slimmed environment for the Nahual server. Drops napari/pyqt vs upstream
+# environment.yaml -- the server doesn't need a GUI, and pulling in Qt
+# would balloon the env and risk runtime conflicts with Nix's GL libs.
+# Keeps a single channel (conda-forge) like upstream's environment.yaml so
+# the solver isn't fighting between pytorch::* and conda-forge::* variants.
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  # libtorch=*=cuda* selects the GPU build of pytorch on conda-forge.
+  - pytorch>=2.5
+  - libtorch=*=cuda*
+  - torchvision
+  - segment-anything
+  # Heavy conda-only deps that pin micro-sam.
+  - nifty>=1.2.3
+  - python-elf>=0.7.1
+  - torch_em>=0.8
+  - vigra
+  # Native imaging / IO
+  - imagecodecs
+  - tifffile
+  - imageio
+  - zarr
+  - xarray
+  - scikit-image
+  - scikit-learn
+  - natsort
+  - tqdm
+  - timm
+  - pooch
+  - python-xxhash
+  - magicgui
+  - pip
+  - pip:
+      # Server transport. nahual ships on PyPI as `nahual==0.0.8`, pynng>=0.9
+      # has manylinux wheels, both install cleanly into the conda env.
+      - nahual==0.0.8
+      - pynng>=0.9.0
+      - trio
+      - loguru
+      # MobileSAM is required for the vit_t backbone, pip-only.
+      - git+https://github.com/ChaoningZhang/MobileSAM.git
