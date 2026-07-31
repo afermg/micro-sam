@@ -40,7 +40,7 @@ address = sys.argv[1]
 
 def setup(
     model_type: str = "vit_b_lm",
-    device: int | None = None,
+    device: int | str | None = None,
     checkpoint: str | None = None,
     segmentation_mode: str | None = None,
     is_tiled: bool = False,
@@ -59,11 +59,17 @@ def setup(
     )
 
     if device is None:
-        device = 0
-    if torch.cuda.is_available():
-        torch_device = torch.device(int(device) if isinstance(device, int) else device)
+        torch_device = torch.device(
+            "cuda:0" if torch.cuda.is_available() else "cpu"
+        )
+    elif isinstance(device, int):
+        torch_device = torch.device(f"cuda:{device}")
     else:
-        torch_device = torch.device("cpu")
+        torch_device = torch.device(device)
+    if torch_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"CUDA device {torch_device} was requested but CUDA is unavailable"
+        )
 
     predictor, segmenter = get_predictor_and_segmenter(
         model_type=model_type,
@@ -108,7 +114,9 @@ def process(
         Instance label map of shape ``(N, H, W)``.
     """
     if pixels.ndim != 5:
-        raise ValueError(f"Expected NCZYX (5D) array, got shape {pixels.shape}")
+        raise ValueError(
+            f"Expected NCZYX (5D) array, got shape {pixels.shape}"
+        )
 
     n, c, z, h, w = pixels.shape
     if z != 1:

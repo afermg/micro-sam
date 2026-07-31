@@ -1,5 +1,5 @@
 {
-  description = "Nahual server wrap for micro-sam (Segment Anything for Microscopy).";
+  description = "Nahual server wrap for micro-sam (Segment Anything for Microscopy)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -9,34 +9,21 @@
     nahual-flake.url = "github:afermg/nahual";
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      flake-utils,
-      systems,
-      ...
-    }@inputs:
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+    ...
+  } @ inputs:
     flake-utils.lib.eachDefaultSystem (
-      system:
-      let
+      system: let
         pkgs = import nixpkgs {
-          system = system;
+          inherit system;
           config = {
             allowUnfree = true;
-            # GPU is required. micro-sam ships SAM weights that target CUDA;
-            # CPU inference is impractically slow.
             cudaSupport = true;
           };
         };
-
-        # Pin to the default python (3.13 on current unstable). vigra,
-        # nifty, affogato all build their pybind11 modules against this
-        # interpreter; bumping it forces a full C++ rebuild of all three.
-        # We further override numba's pytestCheckPhase: turning on
-        # cudaSupport flips the closure off the binary cache, so
-        # nixpkgs would otherwise re-run numba's 30+ min serial test
-        # suite on every dev shell.
         python = pkgs.python3.override {
           packageOverrides = pyfinal: pyprev: {
             numba = pyprev.numba.overridePythonAttrs (_: {
@@ -45,19 +32,12 @@
               pytestCheckPhase = "true";
               installCheckPhase = "true";
             });
-            # numbagg's pytest also takes ~15 min on the cuda-enabled
-            # closure. Skip it -- our import path goes through
-            # xarray->numbagg only at module-load time.
             numbagg = pyprev.numbagg.overridePythonAttrs (_: {
               doCheck = false;
               doInstallCheck = false;
               pytestCheckPhase = "true";
               installCheckPhase = "true";
             });
-            # Same story for xarray: cudaSupport-enabled scope means we
-            # rebuild it from scratch, and its pytest suite is huge
-            # (and downloads test fixtures from the network in the
-            # sandbox, which then hangs).
             xarray = pyprev.xarray.overridePythonAttrs (_: {
               doCheck = false;
               doInstallCheck = false;
@@ -66,82 +46,78 @@
             });
           };
         };
-
         ourPackages = pkgs.callPackage ./nix {
           python3Packages = python.pkgs;
           nahualSrc = inputs.nahual-flake;
         };
+        python_with_pkgs = python.withPackages (pp: [
+          ourPackages.nahual
+          ourPackages.micro_sam
+        ]);
+        runServer = pkgs.writeScriptBin "nahual-microsam" ''
+          #!${pkgs.bash}/bin/bash
+          export PYTHONSAFEPATH=1
+          : "''${MICROSAM_CACHEDIR:=''${XDG_CACHE_HOME:-$HOME/.cache}/micro_sam}"
+          export MICROSAM_CACHEDIR
+          mkdir -p "$MICROSAM_CACHEDIR"
+          exec ${python_with_pkgs}/bin/python ${self}/server.py \
+            "''${1:-tcp://0.0.0.0:5555}"
+        '';
+        microsamApp = {
+          type = "app";
+          program = "${runServer}/bin/nahual-microsam";
+        };
       in
-      with pkgs;
-      rec {
-        formatter = pkgs.alejandra;
-
-        # Re-pack as a simple attrset so `nix flake check` doesn't try to
-        # treat passthru / override functions as derivations.
-        packages = {
-          inherit (ourPackages)
-            nahual
-            segment_anything
-            vigra
-            affogato
-            nifty
-            python-elf
-            torch_em
-            micro_sam
-            ;
-          default = ourPackages.micro_sam;
-        };
-
-        apps.default =
-          let
-            python_with_pkgs = python.withPackages (pp: [
-              ourPackages.nahual
-              ourPackages.micro_sam
-              # micro_sam already depends on segment_anything / torch_em /
-              # python-elf / nifty / vigra transitively. Listed here for
-              # debuggability of `nix run` env.
-            ]);
-            runServer = pkgs.writeScriptBin "runserver.sh" ''
-              #!${pkgs.bash}/bin/bash
-              # PYTHONSAFEPATH=1 (Python 3.11+) keeps Python from prepending
-              # the script's directory to sys.path so the in-tree `micro_sam/`
-              # source tree never shadows the nix-built package.
-              export PYTHONSAFEPATH=1
-              ${python_with_pkgs}/bin/python ${self}/server.py ''${@:-"ipc:///tmp/microsam.ipc"}
-            '';
-          in
-          {
-            type = "app";
-            program = "${runServer}/bin/runserver.sh";
-          };
-
-        devShells = {
-          default =
-            let
-              python_with_pkgs = python.withPackages (pp: [
-                ourPackages.nahual
-                ourPackages.micro_sam
-                # Dev-only extras the basic_test / client examples touch.
-                pp.tifffile
-                pp.scikit-image
-                pp.scikit-learn
-                pp.pyyaml
-              ]);
-            in
-            mkShell {
-              packages = [
-                python_with_pkgs
-                pkgs.cudaPackages.cudatoolkit
-              ];
-              shellHook = ''
-                # PYTHONSAFEPATH=1 (Python 3.11+) keeps Python from prepending
-                # the script's directory to sys.path so `python basic_test.py`
-                # never picks up the in-tree `micro_sam/` source tree instead
-                # of the nix-built package.
-                export PYTHONSAFEPATH=1
-              '';
+        with pkgs; rec {
+          formatter = pkgs.alejandra;
+          packages =
+            {
+              inherit
+                (ourPackages)
+                nahual
+                segment_anything
+                vigra
+                affogato
+                nifty
+                python-elf
+                torch_em
+                micro_sam
+                ;
+              default = ourPackages.micro_sam;
+            }
+            // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+              oci-image = import ./nix/oci-image.nix {
+                inherit pkgs;
+                name = "microsam";
+                title = "Nahual micro-sam";
+                description = "Segment Anything for Microscopy served through Nahual";
+                source = "https://github.com/afermg/micro-sam";
+                revision = self.rev or self.dirtyRev or "unknown";
+                server = runServer;
+                entrypoint = microsamApp.program;
+              };
             };
-        };
-      }
+          inherit python_with_pkgs;
+          scripts.runServer = runServer;
+          apps = rec {
+            microsam = microsamApp;
+            default = microsam;
+          };
+          devShells.default = mkShell {
+            packages = [
+              python_with_pkgs
+              pkgs.cudaPackages.cudatoolkit
+              python.pkgs.tifffile
+              python.pkgs.scikit-image
+              python.pkgs.scikit-learn
+              python.pkgs.pyyaml
+            ];
+            shellHook = ''
+              export PYTHONSAFEPATH=1
+              : "''${MICROSAM_CACHEDIR:=''${XDG_CACHE_HOME:-$HOME/.cache}/micro_sam}"
+              export MICROSAM_CACHEDIR
+            '';
+          };
+        }
     );
 }
